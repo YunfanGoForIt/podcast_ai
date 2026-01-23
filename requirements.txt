@@ -1,0 +1,6 @@
+# 播客解析项目依赖
+requests>=2.28.0
+pyyaml>=6.0
+python-dotenv>=1.0.0
+openai>=1.0.0  # 可选，用于OpenAI API
+anthropic>=0.3.0  # 可选，用于Anthropic API
