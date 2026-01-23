@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 播客自动化服务
-定时从飞书获取新链接，下载音频，调用通义听悟解析，保存笔记
+定时从飞书获取新链接，调用 Qwen ASR 转写，生成笔记并保存
 """
 
 import os
@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 import requests
 from dotenv import load_dotenv
+import fcntl
 
 # 加载环境变量
 load_dotenv()
@@ -26,9 +27,10 @@ PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # 导入项目模块
-from xiaoyuzhou_downloader import get_episode_info, download_audio
-from tingwu_client import TingwuClient
-from markdown_generator import MarkdownGenerator
+from xiaoyuzhou_downloader import get_episode_info
+from qwen_asr_client import QwenASRClient
+from markdown_generator import MarkdownNoteGenerator
+from llm_client import LLMManager
 import yaml
 
 # ==================== 配置 ====================
@@ -43,18 +45,16 @@ class Config:
         self.feishu_app_id = os.getenv("FEISHU_APP_ID")
         self.feishu_app_secret = os.getenv("FEISHU_APP_SECRET")
 
-        # 加载YAML配置
-        config_path = PROJECT_ROOT / "config.yaml"
-        with open(config_path, 'r', encoding='utf-8') as f:
-            yaml_config = yaml.safe_load(f)
+        # Qwen ASR 配置
+        self.dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+        if not self.dashscope_api_key:
+            raise ValueError("请设置环境变量 DASHSCOPE_API_KEY")
 
-        # 通义听悟配置
-        self.tingwu_config = {
-            'access_key_id': yaml_config['aliyun']['access_key_id'],
-            'access_key_secret': yaml_config['aliyun']['access_key_secret'],
-            'appkey': yaml_config['aliyun']['appkey'],
-            'region_id': yaml_config['aliyun']['region_id'],
-        }
+        # ASR 模型名称
+        self.asr_model = os.getenv("ASR_MODEL", "qwen3-asr-flash-filetrans")
+
+        # 加载 LLM 配置
+        self.llm_config = self._load_llm_config()
 
         # 目录配置
         self.audio_dir = PROJECT_ROOT / "xiaoyuzhou_audio"
@@ -64,13 +64,28 @@ class Config:
 
         # 任务配置
         self.check_interval = 60  # 检查间隔（秒）
-        self.poll_interval = yaml_config['task']['poll_interval']
-        self.max_polls = yaml_config['task']['max_polls']
 
         # 创建必要的目录
         self.audio_dir.mkdir(exist_ok=True)
         self.notes_dir.mkdir(exist_ok=True)
         self.log_dir.mkdir(exist_ok=True)
+
+    def _load_llm_config(self) -> Optional[Dict[str, Any]]:
+        """加载 LLM 配置"""
+        config_file = PROJECT_ROOT / "config.yaml"
+        if not config_file.exists():
+            print(f"警告: LLM 配置文件不存在: {config_file}，将跳过 LLM 笔记生成")
+            return None
+
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+                llm_config = config.get('llm')
+                print(f"LLM 配置已加载: {llm_config.get('provider', 'unknown') if llm_config else 'None'}")
+                return llm_config
+        except Exception as e:
+            print(f"警告: 加载 LLM 配置失败: {e}")
+            return None
 
 # ==================== 日志配置 ====================
 
@@ -250,12 +265,21 @@ class FeishuClient:
         fields = record.get("fields", {})
 
         # 尝试提取小宇宙链接
-        for key in ["链接", "link", "url", "网址", "小宇宙链接"]:
+        for key in ["播客链接", "链接", "link", "url", "网址", "小宇宙链接"]:
             if key in fields and fields[key]:
                 url = fields[key]
-                # 确保是字符串
-                if isinstance(url, list) and len(url) > 0:
+
+                # 处理飞书URL字段格式（字典）
+                if isinstance(url, dict) and "link" in url:
+                    url = url["link"]
+
+                # 处理列表格式
+                elif isinstance(url, list) and len(url) > 0:
                     url = url[0]
+                    if isinstance(url, dict) and "link" in url:
+                        url = url["link"]
+
+                # 检查是否是小宇宙链接
                 if isinstance(url, str) and "xiaoyuzhoufm.com" in url:
                     return {
                         "record_id": record.get("record_id"),
@@ -272,11 +296,32 @@ class PodcastService:
 
     def __init__(self, config: Config):
         self.config = config
+
+        # 单实例锁：确保只有一个服务实例运行
+        self.lock_file = open(config.log_dir / "podcast_service.lock", 'w')
+        try:
+            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            raise RuntimeError("服务已在运行中！请先停止旧实例再启动新实例。")
+
         self.logger = setup_logging(config)
+        self.logger.info("=" * 60)
+        self.logger.info("获取单实例锁成功，确保只有一个服务实例在运行")
+        self.logger.info("=" * 60)
+
         self.state_manager = StateManager(config.state_file)
         self.feishu_client = FeishuClient(config, self.logger)
-        self.tingwu_client = TingwuClient(config.tingwu_config)
-        self.markdown_generator = MarkdownGenerator()
+        self.asr_client = QwenASRClient(config.dashscope_api_key, self.logger)
+        self.markdown_generator = MarkdownNoteGenerator()
+
+        # 初始化 LLM Manager（如果配置存在）
+        self.llm_manager = None
+        if config.llm_config:
+            try:
+                self.llm_manager = LLMManager(config.llm_config)
+                self.logger.info(f"LLM Manager 已初始化: {config.llm_config.get('provider')}")
+            except Exception as e:
+                self.logger.warning(f"LLM Manager 初始化失败: {e}，将跳过 LLM 笔记生成")
 
         # 初始化飞书token
         if not self.feishu_client.get_tenant_access_token():
@@ -302,76 +347,100 @@ class PodcastService:
                 self.logger.error(f"未找到音频链接: {url}")
                 return False
 
-            # 2. 下载音频
-            self.logger.info(f"下载音频: {episode_title}")
+            self.logger.info(f"音频链接: {audio_url}")
 
-            # 清理文件名
-            safe_title = re.sub(r'[<>:"/\\|?*]', '_', episode_title)
-            safe_title = safe_title[:100]
-
-            # 确定扩展名
-            ext = ".mp3"
-            if ".m4a" in audio_url.lower():
-                ext = ".m4a"
-            elif ".wav" in audio_url.lower():
-                ext = ".wav"
-
-            audio_path = self.config.audio_dir / f"{safe_title}{ext}"
-
-            if not download_audio(audio_url, str(audio_path)):
-                self.logger.error(f"音频下载失败: {audio_url}")
-                return False
-
-            self.logger.info(f"音频已保存: {audio_path}")
-
-            # 3. 上传到通义听悟进行转写
-            self.logger.info("提交通义听悟转写任务...")
-            task_result = self.tingwu_client.submit_with_file_upload(str(audio_path))
-
-            if task_result.get('code') != 0:
-                self.logger.error(f"提交转写任务失败: {task_result}")
-                return False
-
-            task_id = task_result.get('data', {}).get('task_id')
-            self.logger.info(f"转写任务已提交: {task_id}")
-
-            # 4. 等待转写完成
-            self.logger.info("等待转写完成...")
-            final_result = self.tingwu_client.wait_for_result(
-                task_id,
-                poll_interval=self.config.poll_interval,
-                max_polls=self.config.max_polls
+            # 2. 提交转写任务（使用小宇宙音频URL）
+            self.logger.info("提交 Qwen ASR 转写任务...")
+            self.logger.info(f"使用模型: {self.config.asr_model}")
+            submit_result = self.asr_client.submit_transcription(
+                file_url=audio_url,
+                model=self.config.asr_model
             )
 
-            # 5. 解析转写结果
+            if not submit_result.get('success'):
+                self.logger.error(f"提交转写任务失败: {submit_result}")
+                return False
+
+            task_id = submit_result.get('task_id')
+            self.logger.info(f"转写任务已提交: {task_id}")
+
+            # 3. 等待转写完成
+            self.logger.info("等待转写完成（这可能需要几分钟）...")
+            final_result = self.asr_client.wait_for_result(
+                task_id=task_id,
+                timeout=720,  # 12分钟超时
+                poll_interval=10
+            )
+
+            if not final_result.get('success'):
+                self.logger.error(f"转写任务失败: {final_result}")
+                return False
+
+            # 4. 解析转写结果
             self.logger.info("解析转写结果...")
-            parsed_result = self.tingwu_client.parse_transcription_result(final_result)
+            parsed_result = self.asr_client.parse_transcription_result(
+                result=final_result,
+                metadata={
+                    'task_id': task_id,
+                    'title': episode_title,
+                    'url': url
+                }
+            )
 
-            # 6. 生成Markdown笔记
+            # 4.5 使用 LLM 生成笔记（如果可用）
+            llm_notes = {}
+            if self.llm_manager and parsed_result.get('transcription'):
+                try:
+                    self.logger.info("使用 LLM 生成笔记（分段处理）...")
+                    llm_result = self.llm_manager.generate_podcast_notes(
+                        transcription=parsed_result['transcription'],
+                        chapters=parsed_result.get('chapters', []),
+                        summary=parsed_result.get('summary', ''),
+                        keywords=parsed_result.get('keywords', [])
+                    )
+
+                    if 'error' not in llm_result:
+                        self.logger.info(f"LLM 笔记生成成功，共 {len(llm_result.get('segments', []))} 个分段")
+
+                        # 4.6 根据分段内容生成最终的整体概括和关键洞察
+                        self.logger.info("生成最终整体概括和关键洞察...")
+                        final_summary = self.llm_manager.generate_final_summary(
+                            segments_content=llm_result.get('markdown', '')
+                        )
+
+                        llm_notes = {
+                            'segments': llm_result.get('segments', []),
+                            'segments_markdown': llm_result.get('markdown', ''),
+                            'final_summary': final_summary.get('overall_summary', ''),
+                            'key_insights': final_summary.get('key_insights', [])
+                        }
+                        self.logger.info(f"最终概括和关键洞察生成完成，共 {len(final_summary.get('key_insights', []))} 条关键洞察")
+                    else:
+                        self.logger.warning(f"LLM 笔记生成失败: {llm_result.get('error')}")
+
+                except Exception as e:
+                    self.logger.warning(f"LLM 笔记生成异常: {e}，将使用基础笔记")
+            else:
+                self.logger.info("LLM 不可用，将使用基础笔记格式")
+
+            # 5. 生成Markdown笔记（内部已保存）
             self.logger.info("生成Markdown笔记...")
-            markdown_content = self.markdown_generator.generate(parsed_result)
-
-            # 7. 保存笔记
-            # 创建子文件夹（按日期或播客名称）
-            date_folder = datetime.now().strftime("%Y-%m")
-            episode_folder = self.config.notes_dir / date_folder
-            episode_folder.mkdir(exist_ok=True)
-
-            note_path = episode_folder / f"{safe_title}.md"
-
-            with open(note_path, 'w', encoding='utf-8') as f:
-                f.write(markdown_content)
+            note_path = self.markdown_generator.generate(
+                audio_name=episode_title,
+                parsed_data=parsed_result,
+                llm_notes=llm_notes
+            )
 
             self.logger.info(f"笔记已保存: {note_path}")
 
-            # 标记为已处理
+            # 6. 标记为已处理
             self.state_manager.mark_record_processed(
                 record_id,
                 url,
                 {
                     "title": episode_title,
                     "episode_id": episode_id,
-                    "audio_path": str(audio_path),
+                    "audio_url": audio_url,
                     "note_path": str(note_path),
                     "task_id": task_id
                 }
@@ -382,6 +451,20 @@ class PodcastService:
 
         except Exception as e:
             self.logger.error(f"处理失败: {e}", exc_info=True)
+
+            # 标记为失败，避免无限重试
+            self.state_manager.mark_record_processed(
+                record_id,
+                url,
+                {
+                    "title": episode_title if 'episode_title' in locals() else title,
+                    "error": str(e),
+                    "failed": True,
+                    "failed_at": datetime.now().isoformat()
+                }
+            )
+            self.logger.warning(f"已标记为失败记录，下次将跳过: {record_id}")
+
             return False
 
     def check_and_process_new(self) -> int:
@@ -405,11 +488,13 @@ class PodcastService:
 
             # 检查是否已处理
             if self.state_manager.is_record_processed(record_id):
+                self.logger.debug(f"记录已处理，跳过: {record_id}")
                 continue
 
             # 解析链接
             podcast_info = self.feishu_client.parse_podcast_link(record)
             if not podcast_info:
+                self.logger.info(f"未找到有效的小宇宙链接，跳过记录: {record_id}, 字段: {record.get('fields', {}).keys()}")
                 continue
 
             url = podcast_info["url"]

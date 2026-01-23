@@ -51,6 +51,7 @@ logs/
 podcast_state.json
 *.db
 *.sqlite
+/notes
 
 # Downloaded audio files
 xiaoyuzhou_audio/

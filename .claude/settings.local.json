@@ -5,7 +5,16 @@
       "mcp__exa__get_code_context_exa",
       "WebSearch",
       "WebFetch(domain:help.aliyun.com)",
-      "WebFetch(domain:python-podcast-api.readthedocs.io)"
+      "WebFetch(domain:python-podcast-api.readthedocs.io)",
+      "Bash(tail:*)",
+      "Bash(source:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(python3:*)",
+      "Bash(ls:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "Bash(sudo:*)"
     ]
   }
 }

@@ -31,7 +31,7 @@ class MarkdownNoteGenerator:
         生成完整的Markdown笔记
 
         Args:
-            audio_name: 音频文件名
+            audio_name: 播客标题（用于文件名和一级标题）
             parsed_data: 解析后的转写数据
             llm_notes: LLM生成的笔记
             metadata: 额外元数据
@@ -39,10 +39,11 @@ class MarkdownNoteGenerator:
         Returns:
             Markdown内容
         """
-        # 构建笔记文件名
+        # 构建笔记文件名（使用播客标题）
         date_str = datetime.now().strftime("%Y%m%d")
-        base_name = Path(audio_name).stem
-        note_filename = f"{date_str}_{base_name}_笔记.md"
+        # 清理文件名中的非法字符
+        safe_title = self._sanitize_filename(audio_name)
+        note_filename = f"{safe_title}.md"
 
         # 准备章节内容
         chapters_content = self._generate_chapters_content(parsed_data, llm_notes)
@@ -51,15 +52,19 @@ class MarkdownNoteGenerator:
         quotes_content = self._generate_quotes_content(parsed_data)
 
         # 构建完整Markdown
-        markdown = f"""# 播客笔记：{base_name}
+        markdown = f"""# {audio_name}
 
 > 生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 ---
 
+{self._format_llm_notes(llm_notes)}
+
+---
+
 ## 概览
 
-- **音频文件**：{audio_name}
+- **播客标题**：{audio_name}
 - **关键词**：{', '.join(parsed_data.get('keywords', []))}
 
 ### 播客摘要
@@ -72,10 +77,6 @@ class MarkdownNoteGenerator:
 | 章节 | 标题 | 时间范围 |
 |------|------|----------|
 {self._generate_chapter_table(parsed_data.get('chapters', []))}
-
----
-
-{self._format_llm_notes(llm_notes)}
 
 ---
 
@@ -93,13 +94,36 @@ class MarkdownNoteGenerator:
 
 """
 
-        # 保存笔记
+        # 保存笔记到两个位置
+        # 1. 本地 notes 目录
         output_path = self.output_dir / note_filename
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(markdown)
 
+        # 2. Syncthing 同步目录
+        syncthing_dir = Path("/var/lib/syncthing/podcast_notes")
+        try:
+            syncthing_dir.mkdir(parents=True, exist_ok=True)
+            syncthing_path = syncthing_dir / note_filename
+            with open(syncthing_path, 'w', encoding='utf-8') as f:
+                f.write(markdown)
+            print(f"笔记已同步至: {syncthing_path}")
+        except Exception as e:
+            print(f"警告: 同步到 Syncthing 目录失败: {e}")
+
         print(f"笔记已保存至: {output_path}")
         return str(output_path)
+
+    def _sanitize_filename(self, filename: str) -> str:
+        """清理文件名中的非法字符"""
+        # 移除或替换非法字符
+        illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+        for char in illegal_chars:
+            filename = filename.replace(char, '_')
+        # 限制长度
+        if len(filename) > 200:
+            filename = filename[:200]
+        return filename
 
     def _generate_chapters_content(
         self,
@@ -178,13 +202,43 @@ class MarkdownNoteGenerator:
 
     def _format_llm_notes(self, llm_notes: Dict[str, Any]) -> str:
         """格式化LLM生成的笔记"""
-        if not llm_notes.get('markdown'):
+        if not llm_notes:
             return ""
 
-        return f"""## AI 智能总结
+        # 检查是否有新的三步流程结果
+        if llm_notes.get('final_summary'):
+            sections = []
+
+            # 整体概括
+            if llm_notes.get('final_summary'):
+                sections.append(f"""## 整体概括
+
+{llm_notes['final_summary']}
+""")
+
+            # 关键洞察
+            if llm_notes.get('key_insights'):
+                insights_list = "\n".join([f"{i+1}. {insight}" for i, insight in enumerate(llm_notes['key_insights'])])
+                sections.append(f"""## 关键洞察
+
+{insights_list}
+""")
+
+            # 分段详情
+            if llm_notes.get('segments_markdown'):
+                sections.append(f"""{llm_notes['segments_markdown']}
+""")
+
+            return "\n".join(sections)
+
+        # 兼容旧格式
+        elif llm_notes.get('markdown'):
+            return f"""## AI 智能总结
 
 {llm_notes['markdown']}
 """
+
+        return ""
 
     def _format_speakers(self, parsed_data: Dict[str, Any]) -> str:
         """格式化说话人列表"""
@@ -218,8 +272,11 @@ class MarkdownNoteGenerator:
 
         return "\n".join(lines)
 
-    def _format_time(self, seconds: int) -> str:
+    def _format_time(self, seconds) -> str:
         """格式化时间（秒 -> MM:SS 或 HH:MM:SS）"""
+        # 转换为整数（可能是 float）
+        seconds = int(seconds)
+
         if seconds < 0:
             return "00:00"
 
