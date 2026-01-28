@@ -215,6 +215,12 @@ class FeishuClient:
             "Content-Type": "application/json; charset=utf-8"
         }
 
+    def _refresh_token_if_needed(self) -> bool:
+        """如果 token 过期，刷新 token"""
+        if not self.access_token:
+            return self.get_tenant_access_token()
+        return True
+
     def get_all_records(self) -> Optional[List[Dict]]:
         """获取所有记录"""
         search_url = f"{self.base_url}/bitable/v1/apps/{self.config.app_token}/tables/{self.config.table_id}/records/search"
@@ -238,11 +244,39 @@ class FeishuClient:
                     json=payload,
                     timeout=30
                 )
+
+                # 检查是否是 token 过期 (401 或 99991663)
+                if response.status_code == 401:
+                    self.logger.warning("Access token 可能过期，尝试刷新...")
+                    if self.get_tenant_access_token():
+                        # 刷新成功，重试请求
+                        response = requests.post(
+                            search_url,
+                            headers=self._get_headers(),
+                            json=payload,
+                            timeout=30
+                        )
+                    else:
+                        self.logger.error("刷新 token 失败")
+                        return None
+
                 response.raise_for_status()
                 result = response.json()
 
-                if result.get("code") != 0:
-                    self.logger.error(f"飞书API返回错误: {result.get('msg')}")
+                # 检查飞书 API 错误码
+                code = result.get("code")
+                if code != 0:
+                    error_msg = result.get('msg', '')
+                    self.logger.error(f"飞书API返回错误: code={code}, msg={error_msg}")
+
+                    # token 过期错误码，尝试刷新
+                    if code == 99991663:
+                        self.logger.warning("Access token 过期，尝试刷新...")
+                        if self.get_tenant_access_token():
+                            continue  # 刷新成功，重试
+                        else:
+                            return None
+
                     return None
 
                 items = result.get("data", {}).get("items", [])
