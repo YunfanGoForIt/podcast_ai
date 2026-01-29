@@ -100,8 +100,8 @@ class MarkdownNoteGenerator:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(markdown)
 
-        # 2. Syncthing 同步目录
-        syncthing_dir = Path("/var/lib/syncthing/podcast_notes")
+        # 2. Syncthing 同步目录（用户目录下）
+        syncthing_dir = Path.home() / "syncthing" / "podcast_notes"
         try:
             syncthing_dir.mkdir(parents=True, exist_ok=True)
             syncthing_path = syncthing_dir / note_filename

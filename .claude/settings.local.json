@@ -1,20 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "mcp__context7__resolve-library-id",
-      "mcp__exa__get_code_context_exa",
-      "WebSearch",
-      "WebFetch(domain:help.aliyun.com)",
-      "WebFetch(domain:python-podcast-api.readthedocs.io)",
-      "Bash(tail:*)",
-      "Bash(source:*)",
-      "Bash(python:*)",
-      "Bash(pip install:*)",
-      "Bash(python3:*)",
-      "Bash(ls:*)",
-      "Bash(kill:*)",
-      "Bash(pkill:*)",
-      "Bash(sudo:*)"
+      "Bash(systemctl --user:*)",
+      "Bash(systemctl --user enable syncthing.service)",
+      "Bash(systemctl --user start:*)",
+      "Bash(systemctl --user status:*)",
+      "Bash(curl:*)",
+      "Bash(journalctl:*)",
+      "Bash(~/syncthing/syncthing-linux-amd64-v1.29.0/syncthing --help)"
     ]
   }
 }

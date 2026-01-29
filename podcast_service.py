@@ -106,8 +106,23 @@ def setup_logging(config: Config) -> logging.Logger:
 
 # ==================== 状态管理 ====================
 
+class EpisodeState:
+    """单期播客状态"""
+    PENDING = "pending"       # 未处理
+    TRANSCRIBING = "transcribing"  # 转写中
+    TRANSCRIBED = "transcribed"   # 已转写完成（待生成笔记）
+    COMPLETED = "completed"  # 已完成
+    TRANSCRIPTION_FAILED = "transcription_failed"  # 转写失败（可重试）
+
+
 class StateManager:
-    """状态管理，记录已处理的链接"""
+    """状态管理，记录已处理的链接
+
+    状态流转:
+    pending -> transcribing -> transcribed -> completed
+                ↑                              |
+                +------- 失败重试 --------------+
+    """
 
     def __init__(self, state_file: Path):
         self.state_file = state_file
@@ -121,12 +136,8 @@ class StateManager:
                     return json.load(f)
             except Exception as e:
                 logging.warning(f"加载状态文件失败: {e}，将创建新状态")
-                return {}
-        return {
-            "processed_records": {},  # record_id -> 处理信息
-            "processed_urls": {},     # url_hash -> 处理信息
-            "last_check_time": None
-        }
+                return {"episodes": {}, "last_check_time": None}
+        return {"episodes": {}, "last_check_time": None}
 
     def _save_state(self):
         """保存状态"""
@@ -136,37 +147,68 @@ class StateManager:
         except Exception as e:
             logging.error(f"保存状态文件失败: {e}")
 
-    def is_record_processed(self, record_id: str) -> bool:
-        """检查记录是否已处理"""
-        return record_id in self.state.get("processed_records", {})
+    def get_episode(self, episode_id: str) -> Optional[Dict]:
+        """获取episode状态"""
+        return self.state.get("episodes", {}).get(episode_id)
 
-    def is_url_processed(self, url: str) -> bool:
-        """检查URL是否已处理"""
-        url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
-        return url_hash in self.state.get("processed_urls", {})
+    def is_completed(self, episode_id: str) -> bool:
+        """检查是否已完成"""
+        episode = self.get_episode(episode_id)
+        return episode and episode.get("state") == EpisodeState.COMPLETED
 
-    def mark_record_processed(self, record_id: str, url: str, info: Dict[str, Any]):
-        """标记记录为已处理"""
-        if "processed_records" not in self.state:
-            self.state["processed_records"] = {}
-        if "processed_urls" not in self.state:
-            self.state["processed_urls"] = {}
+    def is_transcribed(self, episode_id: str) -> bool:
+        """检查是否已转写完成"""
+        episode = self.get_episode(episode_id)
+        return episode and episode.get("state") in [EpisodeState.TRANSCRIBED, EpisodeState.COMPLETED]
 
-        url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()
+    def update_episode(self, episode_id: str, data: Dict[str, Any]):
+        """更新episode状态"""
+        if "episodes" not in self.state:
+            self.state["episodes"] = {}
 
-        self.state["processed_records"][record_id] = {
-            "url": url,
-            "processed_at": datetime.now().isoformat(),
-            **info
-        }
+        if episode_id not in self.state["episodes"]:
+            self.state["episodes"][episode_id] = {}
 
-        self.state["processed_urls"][url_hash] = {
-            "record_id": record_id,
-            "processed_at": datetime.now().isoformat(),
-            **info
-        }
-
+        self.state["episodes"][episode_id].update({
+            "updated_at": datetime.now().isoformat(),
+            **data
+        })
         self._save_state()
+
+    def mark_transcribing(self, episode_id: str, record_id: str, url: str, title: str, audio_url: str):
+        """标记开始转写"""
+        self.update_episode(episode_id, {
+            "state": EpisodeState.TRANSCRIBING,
+            "record_id": record_id,
+            "url": url,
+            "title": title,
+            "audio_url": audio_url,
+        })
+
+    def mark_transcribed(self, episode_id: str, task_id: str, transcription_result: Dict = None):
+        """标记转写完成"""
+        data = {
+            "state": EpisodeState.TRANSCRIBED,
+            "task_id": task_id,
+        }
+        if transcription_result:
+            data["transcription_result"] = transcription_result
+        self.update_episode(episode_id, data)
+
+    def mark_completed(self, episode_id: str, note_path: str):
+        """标记完成"""
+        self.update_episode(episode_id, {
+            "state": EpisodeState.COMPLETED,
+            "note_path": note_path,
+            "completed_at": datetime.now().isoformat(),
+        })
+
+    def mark_failed(self, episode_id: str, error: str):
+        """标记失败（保留状态，可重试）"""
+        self.update_episode(episode_id, {
+            "error": error,
+            "failed_at": datetime.now().isoformat(),
+        })
 
     def update_last_check_time(self):
         """更新最后检查时间"""
@@ -381,33 +423,137 @@ class PodcastService:
                 self.logger.error(f"未找到音频链接: {url}")
                 return False
 
-            self.logger.info(f"音频链接: {audio_url}")
-
-            # 2. 提交转写任务（使用小宇宙音频URL）
-            self.logger.info("提交 Qwen ASR 转写任务...")
-            self.logger.info(f"使用模型: {self.config.asr_model}")
-            submit_result = self.asr_client.submit_transcription(
-                file_url=audio_url,
-                model=self.config.asr_model
-            )
-
-            if not submit_result.get('success'):
-                self.logger.error(f"提交转写任务失败: {submit_result}")
+            if not episode_id:
+                self.logger.error(f"未找到episode_id: {url}")
                 return False
 
-            task_id = submit_result.get('task_id')
-            self.logger.info(f"转写任务已提交: {task_id}")
+            self.logger.info(f"Episode ID: {episode_id}")
+            self.logger.info(f"音频链接: {audio_url}")
 
-            # 3. 等待转写完成
-            self.logger.info("等待转写完成（这可能需要几分钟）...")
-            final_result = self.asr_client.wait_for_result(
-                task_id=task_id,
-                timeout=720,  # 12分钟超时
-                poll_interval=10
-            )
+            # 2. 检查是否已转写完成（断点续传）
+            existing_episode = self.state_manager.get_episode(episode_id)
+
+            # 如果已完成，直接跳过
+            if self.state_manager.is_completed(episode_id):
+                self.logger.info(f"该episode已完成，跳过: {episode_id}")
+                return True
+
+            # 如果已转写完成但笔记失败，尝试重新生成笔记
+            if self.state_manager.is_transcribed(episode_id):
+                self.logger.info(f"该episode已转写完成，尝试生成笔记: {episode_id}")
+                return self._generate_notes(
+                    episode_id=episode_id,
+                    episode_title=episode_title,
+                    url=url,
+                    record_id=record_id,
+                    transcription_result=existing_episode.get("transcription_result"),
+                    task_id=existing_episode.get("task_id")
+                )
+
+            # 如果转写失败且有 task_id，直接尝试获取结果（断点续传）
+            existing = self.state_manager.get_episode(episode_id)
+            if existing and existing.get("state") == EpisodeState.TRANSCRIPTION_FAILED:
+                if existing.get("task_id"):
+                    self.logger.info(f"该episode转写曾失败，尝试获取已有结果: {existing['task_id']}")
+                    final_result = self.asr_client.wait_for_result(
+                        task_id=existing["task_id"],
+                        timeout=60,
+                        poll_interval=5
+                    )
+                    if final_result.get('success'):
+                        self.logger.info("转写结果已就绪")
+                    else:
+                        # 任务可能还在进行中或彻底失败，重新提交
+                        self.logger.info("转写仍在进行或失败，重新提交任务...")
+                        submit_result = self.asr_client.submit_transcription(
+                            file_url=audio_url,
+                            model=self.config.asr_model
+                        )
+                        if not submit_result.get('success'):
+                            self.state_manager.update_episode(episode_id, {
+                                "state": EpisodeState.TRANSCRIPTION_FAILED,
+                                "error": str(submit_result),
+                                "failed_at": datetime.now().isoformat()
+                            })
+                            return False
+                        task_id = submit_result.get('task_id')
+                        self.state_manager.update_episode(episode_id, {"task_id": task_id})
+                        self.logger.info(f"转写任务已提交: {task_id}")
+                        final_result = self.asr_client.wait_for_result(
+                            task_id=task_id,
+                            timeout=720,
+                            poll_interval=10
+                        )
+
+            # 3. 提交转写任务（使用小宇宙音频URL）
+            self.state_manager.mark_transcribing(episode_id, record_id, url, title, audio_url)
+
+            self.logger.info("提交 Qwen ASR 转写任务...")
+            self.logger.info(f"使用模型: {self.config.asr_model}")
+
+            # 如果有已存在的 task_id，尝试获取结果
+            if existing_episode and existing_episode.get("task_id"):
+                task_id = existing_episode["task_id"]
+                self.logger.info(f"使用已有的task_id获取结果: {task_id}")
+                final_result = self.asr_client.wait_for_result(
+                    task_id=task_id,
+                    timeout=60,  # 较短超时，因为任务可能已完成
+                    poll_interval=5
+                )
+
+                if not final_result.get('success'):
+                    # 任务可能还在进行中，重新提交
+                    self.logger.info("已有任务未完成，重新提交...")
+                    submit_result = self.asr_client.submit_transcription(
+                        file_url=audio_url,
+                        model=self.config.asr_model
+                    )
+                    if not submit_result.get('success'):
+                        self.logger.error(f"提交转写任务失败: {submit_result}")
+                        self.state_manager.mark_failed(episode_id, str(submit_result))
+                        return False
+                    task_id = submit_result.get('task_id')
+                    self.logger.info(f"转写任务已提交: {task_id}")
+
+                    # 等待转写完成
+                    self.logger.info("等待转写完成（这可能需要几分钟）...")
+                    final_result = self.asr_client.wait_for_result(
+                        task_id=task_id,
+                        timeout=720,  # 12分钟超时
+                        poll_interval=10
+                    )
+            else:
+                # 提交新任务
+                submit_result = self.asr_client.submit_transcription(
+                    file_url=audio_url,
+                    model=self.config.asr_model
+                )
+
+                if not submit_result.get('success'):
+                    self.logger.error(f"提交转写任务失败: {submit_result}")
+                    self.state_manager.mark_failed(episode_id, str(submit_result))
+                    return False
+
+                task_id = submit_result.get('task_id')
+                self.logger.info(f"转写任务已提交: {task_id}")
+
+                # 等待转写完成
+                self.logger.info("等待转写完成（这可能需要几分钟）...")
+                final_result = self.asr_client.wait_for_result(
+                    task_id=task_id,
+                    timeout=720,  # 12分钟超时
+                    poll_interval=10
+                )
 
             if not final_result.get('success'):
                 self.logger.error(f"转写任务失败: {final_result}")
+                # 标记为转写失败，保留 task_id 供重试
+                self.state_manager.update_episode(episode_id, {
+                    "state": EpisodeState.TRANSCRIPTION_FAILED,
+                    "task_id": task_id,
+                    "transcription_error": str(final_result),
+                    "failed_at": datetime.now().isoformat()
+                })
                 return False
 
             # 4. 解析转写结果
@@ -421,22 +567,48 @@ class PodcastService:
                 }
             )
 
-            # 4.5 使用 LLM 生成笔记（如果可用）
+            # 标记为已转写
+            self.state_manager.mark_transcribed(episode_id, task_id, parsed_result)
+            self.logger.info(f"转写完成，task_id: {task_id}")
+
+            # 5. 生成笔记
+            return self._generate_notes(
+                episode_id=episode_id,
+                episode_title=episode_title,
+                url=url,
+                record_id=record_id,
+                transcription_result=parsed_result,
+                task_id=task_id
+            )
+
+        except Exception as e:
+            self.logger.error(f"处理失败: {e}", exc_info=True)
+            # 从 episode_id 获取失败信息
+            error_episode_id = episode_info.get('episode_id', '') if 'episode_info' in dir() else ''
+            if error_episode_id:
+                self.state_manager.mark_failed(error_episode_id, str(e))
+            return False
+
+    def _generate_notes(self, episode_id: str, episode_title: str, url: str,
+                        record_id: str, transcription_result: Dict, task_id: str) -> bool:
+        """生成笔记（可独立调用，支持断点续传）"""
+        try:
+            # 6. 使用 LLM 生成笔记（如果可用）
             llm_notes = {}
-            if self.llm_manager and parsed_result.get('transcription'):
+            if self.llm_manager and transcription_result.get('transcription'):
                 try:
                     self.logger.info("使用 LLM 生成笔记（分段处理）...")
                     llm_result = self.llm_manager.generate_podcast_notes(
-                        transcription=parsed_result['transcription'],
-                        chapters=parsed_result.get('chapters', []),
-                        summary=parsed_result.get('summary', ''),
-                        keywords=parsed_result.get('keywords', [])
+                        transcription=transcription_result['transcription'],
+                        chapters=transcription_result.get('chapters', []),
+                        summary=transcription_result.get('summary', ''),
+                        keywords=transcription_result.get('keywords', [])
                     )
 
                     if 'error' not in llm_result:
                         self.logger.info(f"LLM 笔记生成成功，共 {len(llm_result.get('segments', []))} 个分段")
 
-                        # 4.6 根据分段内容生成最终的整体概括和关键洞察
+                        # 6.1 根据分段内容生成最终的整体概括和关键洞察
                         self.logger.info("生成最终整体概括和关键洞察...")
                         final_summary = self.llm_manager.generate_final_summary(
                             segments_content=llm_result.get('markdown', '')
@@ -457,48 +629,27 @@ class PodcastService:
             else:
                 self.logger.info("LLM 不可用，将使用基础笔记格式")
 
-            # 5. 生成Markdown笔记（内部已保存）
+            # 7. 生成Markdown笔记（内部已保存）
             self.logger.info("生成Markdown笔记...")
             note_path = self.markdown_generator.generate(
                 audio_name=episode_title,
-                parsed_data=parsed_result,
+                parsed_data=transcription_result,
                 llm_notes=llm_notes
             )
 
             self.logger.info(f"笔记已保存: {note_path}")
 
-            # 6. 标记为已处理
-            self.state_manager.mark_record_processed(
-                record_id,
-                url,
-                {
-                    "title": episode_title,
-                    "episode_id": episode_id,
-                    "audio_url": audio_url,
-                    "note_path": str(note_path),
-                    "task_id": task_id
-                }
-            )
+            # 8. 标记为已完成
+            self.state_manager.mark_completed(episode_id, str(note_path))
 
             self.logger.info(f"✅ 处理完成: {episode_title}")
             return True
 
         except Exception as e:
-            self.logger.error(f"处理失败: {e}", exc_info=True)
-
-            # 标记为失败，避免无限重试
-            self.state_manager.mark_record_processed(
-                record_id,
-                url,
-                {
-                    "title": episode_title if 'episode_title' in locals() else title,
-                    "error": str(e),
-                    "failed": True,
-                    "failed_at": datetime.now().isoformat()
-                }
-            )
-            self.logger.warning(f"已标记为失败记录，下次将跳过: {record_id}")
-
+            self.logger.error(f"生成笔记失败: {e}", exc_info=True)
+            # 标记失败，但保留转写状态，可重试
+            self.state_manager.mark_failed(episode_id, str(e))
+            self.logger.warning(f"笔记生成失败，但转写已完成，将自动重试: {episode_id}")
             return False
 
     def check_and_process_new(self) -> int:
@@ -520,11 +671,6 @@ class PodcastService:
         for record in records:
             record_id = record.get("record_id")
 
-            # 检查是否已处理
-            if self.state_manager.is_record_processed(record_id):
-                self.logger.debug(f"记录已处理，跳过: {record_id}")
-                continue
-
             # 解析链接
             podcast_info = self.feishu_client.parse_podcast_link(record)
             if not podcast_info:
@@ -534,10 +680,20 @@ class PodcastService:
             url = podcast_info["url"]
             title = podcast_info["title"]
 
-            # 检查URL是否已处理
-            if self.state_manager.is_url_processed(url):
-                self.logger.info(f"URL已处理过，跳过: {url}")
-                self.state_manager.mark_record_processed(record_id, url, {"skipped": True})
+            # 获取episode信息以获取 episode_id
+            episode_info = get_episode_info(url)
+            if not episode_info:
+                self.logger.warning(f"无法获取episode信息，跳过: {url}")
+                continue
+
+            episode_id = episode_info.get('episode_id')
+            if not episode_id:
+                self.logger.warning(f"未找到episode_id，跳过: {url}")
+                continue
+
+            # 检查是否已完成
+            if self.state_manager.is_completed(episode_id):
+                self.logger.debug(f"该episode已完成，跳过: {episode_id}")
                 continue
 
             # 处理
