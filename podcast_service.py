@@ -295,11 +295,25 @@ class FeishuClient:
                     timeout=30
                 )
 
-                # 检查是否是 token 过期 (401 或 99991663)
+                # 检查是否是 token 过期 (401 或特定错误码)
                 if response.status_code == 401:
                     self.logger.warning("Access token 可能过期，尝试刷新...")
                     if self.get_tenant_access_token():
                         # 刷新成功，重试请求
+                        response = requests.post(
+                            search_url,
+                            headers=self._get_headers(),
+                            json=payload,
+                            timeout=30
+                        )
+                    else:
+                        self.logger.error("刷新 token 失败")
+                        return None
+
+                # 处理 400 错误，尝试刷新 token 后重试
+                if response.status_code == 400:
+                    self.logger.warning("收到 400 错误，尝试刷新 token 后重试...")
+                    if self.get_tenant_access_token():
                         response = requests.post(
                             search_url,
                             headers=self._get_headers(),
@@ -339,7 +353,15 @@ class FeishuClient:
                 page_token = result.get("data", {}).get("page_token")
 
             except Exception as e:
+                # 记录更详细的错误信息
                 self.logger.error(f"获取飞书记录失败: {e}")
+                if 'response' in dir() and hasattr(response, 'status_code'):
+                    self.logger.error(f"状态码: {response.status_code}")
+                    self.logger.error(f"响应头: {dict(response.headers)}")
+                    try:
+                        self.logger.error(f"响应体: {response.text[:500]}")
+                    except:
+                        pass
                 return None
 
         return all_records
