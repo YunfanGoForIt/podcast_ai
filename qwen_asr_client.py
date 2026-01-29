@@ -287,7 +287,7 @@ class QwenASRClient:
 
         # 如果有 sentences 数据，构建分段转录
         transcription_list = []
-        speakers = set()
+        speakers = []  # 改为 list
 
         if sentences:
             for sent in sentences:
@@ -297,7 +297,8 @@ class QwenASRClient:
                     'start_time': sent.get('begin_time', 0) / 1000,  # 毫秒转秒
                     'end_time': sent.get('end_time', 0) / 1000
                 })
-                speakers.add('未知')
+                if '未知' not in speakers:
+                    speakers.append('未知')
 
             self.logger.info(f"[Qwen ASR] 解析了 {len(transcription_list)} 个句子片段")
         else:

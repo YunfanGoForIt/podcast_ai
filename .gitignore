@@ -54,6 +54,7 @@ podcast_state.json
 /notes
 
 # Downloaded audio files
+workspace/
 xiaoyuzhou_audio/
 podbean_test_audio/
 temp_audio/

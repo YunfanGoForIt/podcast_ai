@@ -2,9 +2,12 @@
 Markdown 笔记生成器
 结果转换为格式化的Markdown笔记
 将播客解析"""
+import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class MarkdownNoteGenerator:
@@ -107,11 +110,11 @@ class MarkdownNoteGenerator:
             syncthing_path = syncthing_dir / note_filename
             with open(syncthing_path, 'w', encoding='utf-8') as f:
                 f.write(markdown)
-            print(f"笔记已同步至: {syncthing_path}")
+            logger.info(f"笔记已同步至 Syncthing: {syncthing_path}")
         except Exception as e:
-            print(f"警告: 同步到 Syncthing 目录失败: {e}")
+            logger.warning(f"同步到 Syncthing 目录失败: {e}")
 
-        print(f"笔记已保存至: {output_path}")
+        logger.info(f"笔记已保存至: {output_path}")
         return str(output_path)
 
     def _sanitize_filename(self, filename: str) -> str:

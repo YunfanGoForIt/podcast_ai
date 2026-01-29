@@ -61,6 +61,7 @@ class Config:
         self.notes_dir = PROJECT_ROOT / "notes"
         self.state_file = PROJECT_ROOT / "podcast_state.json"
         self.log_dir = PROJECT_ROOT / "logs"
+        self.workspace_dir = PROJECT_ROOT / "workspace"  # 转写结果存储目录
 
         # 任务配置
         self.check_interval = 60  # 检查间隔（秒）
@@ -69,6 +70,7 @@ class Config:
         self.audio_dir.mkdir(exist_ok=True)
         self.notes_dir.mkdir(exist_ok=True)
         self.log_dir.mkdir(exist_ok=True)
+        self.workspace_dir.mkdir(exist_ok=True)
 
     def _load_llm_config(self) -> Optional[Dict[str, Any]]:
         """加载 LLM 配置"""
@@ -185,15 +187,21 @@ class StateManager:
             "audio_url": audio_url,
         })
 
-    def mark_transcribed(self, episode_id: str, task_id: str, transcription_result: Dict = None):
+    def mark_transcribed(self, episode_id: str, task_id: str):
         """标记转写完成"""
-        data = {
+        self.update_episode(episode_id, {
             "state": EpisodeState.TRANSCRIBED,
             "task_id": task_id,
-        }
-        if transcription_result:
-            data["transcription_result"] = transcription_result
-        self.update_episode(episode_id, data)
+        })
+
+    def get_transcription_path(self, episode_id: str) -> Optional[str]:
+        """获取转写结果文件路径"""
+        episode = self.get_episode(episode_id)
+        return episode.get("transcription_path") if episode else None
+
+    def set_transcription_path(self, episode_id: str, path: str):
+        """设置转写结果文件路径"""
+        self.update_episode(episode_id, {"transcription_path": path})
 
     def mark_completed(self, episode_id: str, note_path: str):
         """标记完成"""
@@ -446,8 +454,7 @@ class PodcastService:
                     episode_title=episode_title,
                     url=url,
                     record_id=record_id,
-                    transcription_result=existing_episode.get("transcription_result"),
-                    task_id=existing_episode.get("task_id")
+                    task_id=self.state_manager.get_episode(episode_id).get("task_id", "")
                 )
 
             # 如果转写失败且有 task_id，直接尝试获取结果（断点续传）
@@ -567,17 +574,26 @@ class PodcastService:
                 }
             )
 
-            # 标记为已转写
-            self.state_manager.mark_transcribed(episode_id, task_id, parsed_result)
+            # 5. 保存转写结果到 workspace
+            transcription_path = self.config.workspace_dir / f"{episode_id}.json"
+            try:
+                with open(transcription_path, 'w', encoding='utf-8') as f:
+                    json.dump(parsed_result, f, ensure_ascii=False, indent=2)
+                self.logger.info(f"转写结果已保存: {transcription_path}")
+            except Exception as e:
+                self.logger.warning(f"保存转写结果失败: {e}")
+
+            # 6. 标记为已转写
+            self.state_manager.mark_transcribed(episode_id, task_id)
+            self.state_manager.set_transcription_path(episode_id, str(transcription_path))
             self.logger.info(f"转写完成，task_id: {task_id}")
 
-            # 5. 生成笔记
+            # 7. 生成笔记
             return self._generate_notes(
                 episode_id=episode_id,
                 episode_title=episode_title,
                 url=url,
                 record_id=record_id,
-                transcription_result=parsed_result,
                 task_id=task_id
             )
 
@@ -590,10 +606,21 @@ class PodcastService:
             return False
 
     def _generate_notes(self, episode_id: str, episode_title: str, url: str,
-                        record_id: str, transcription_result: Dict, task_id: str) -> bool:
+                        record_id: str, task_id: str) -> bool:
         """生成笔记（可独立调用，支持断点续传）"""
         try:
-            # 6. 使用 LLM 生成笔记（如果可用）
+            # 从 workspace 加载转写结果
+            transcription_path = self.state_manager.get_transcription_path(episode_id)
+            if not transcription_path or not Path(transcription_path).exists():
+                self.logger.error(f"转写结果文件不存在: {transcription_path}")
+                return False
+
+            with open(transcription_path, 'r', encoding='utf-8') as f:
+                transcription_result = json.load(f)
+
+            self.logger.info(f"从 {transcription_path} 加载转写结果")
+
+            # 使用 LLM 生成笔记（如果可用）
             llm_notes = {}
             if self.llm_manager and transcription_result.get('transcription'):
                 try:
